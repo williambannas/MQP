@@ -1,5 +1,5 @@
 CFLAGS?=-O2 -g -Wall -W 
-LDLIBS+=-liio -lpthread -lm -lad9361
+LDLIBS+=-liio -lpthread -lm -lad9361 -lfftw3
 PROGNAME=sampling
 
 all: sampling

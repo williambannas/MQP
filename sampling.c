@@ -10,6 +10,7 @@
 #include <signal.h>
 #include <fcntl.h>
 #include <ctype.h>
+#include <complex.h>
 #include <sys/stat.h>
 #include <sys/ioctl.h>
 #include <sys/select.h>
@@ -19,20 +20,12 @@
 #include "sampling.h"
 
 #define MODES_DEFAULT_RATE         2000000
-#define MODES_DEFAULT_FREQ         1090000000
+#define MODES_DEFAULT_FREQ         902000000
 #define MODES_DATA_LEN             (16*16384)   /* 256k */
 #define MODES_AUTO_GAIN            -100         /* Use automatic gain. */
 #define MODES_MAX_GAIN             70       /* Use max available gain. */
 
-
-// TODO: fix so that this is just the sample size, nothing to do with the length of a message?
-// unlesss we want to decode?
-#define MODES_PREAMBLE_US 8       /* microseconds */
-#define MODES_LONG_MSG_BITS 112
-#define MODES_SHORT_MSG_BITS 56
-#define MODES_FULL_LEN (MODES_PREAMBLE_US+MODES_LONG_MSG_BITS)
-#define MODES_LONG_MSG_BYTES (112/8)
-#define MODES_SHORT_MSG_BYTES (56/8)
+#define FFT_SIZE 		   		   128
 
 #define MODES_NOTUSED(V) ((void) V)
 
@@ -69,6 +62,12 @@ struct {
 
 /* =============================== Initialization =========================== */
 
+double win_hanning(int j, int n) {
+    double a = 2.0 * M_PI / (n - 1), w;
+    w = 0.5 * (1.0 - cos(a * j));
+    return (w);
+}
+
 void modesInitConfig(void) {
 	Modes.gain = MODES_AUTO_GAIN;
 	Modes.dev_index = 0;
@@ -77,7 +76,6 @@ void modesInitConfig(void) {
 }
 
 void modesInit(void) {
-	int i, q;
 
 	pthread_mutex_init(&Modes.data_mutex, NULL);
 	pthread_cond_init(&Modes.data_cond, NULL);
@@ -86,7 +84,8 @@ void modesInit(void) {
 	 * in the message detection loop, back at the start of the next data
 	 * to process. This way we are able to also detect messages crossing
 	 * two reads. */
-	Modes.data_len = MODES_DATA_LEN + (MODES_FULL_LEN - 1) * 4;
+
+	Modes.data_len = MODES_DATA_LEN + sizeof(fftw_complex)*FFT_SIZE;
 	Modes.data_ready = 0;
 	if ((Modes.data = malloc(Modes.data_len)) == NULL) {
 		fprintf(stderr, "Out of memory allocating data buffer.\n");
@@ -95,6 +94,15 @@ void modesInit(void) {
 	memset(Modes.data, 127, Modes.data_len);
 
 	Modes.exit = 0;
+
+	Modes.win = fftw_malloc(sizeof(double) * FFT_SIZE);
+    Modes.in_c = fftw_malloc(sizeof(fftw_complex) * FFT_SIZE);
+    Modes.out = fftw_malloc(sizeof(fftw_complex) * (FFT_SIZE + 1));
+    Modes.plan_forward = fftw_plan_dft_1d(FFT_SIZE, Modes.in_c, Modes.out, FFTW_FORWARD,
+                                    FFTW_ESTIMATE);
+
+	for (int i = 0; i < FFT_SIZE; i ++)
+        Modes.win[i] = win_hanning(i, 16384);
 }
 
 /* =============================== PlutoSDR handling ========================== */
@@ -169,14 +177,12 @@ void modesInitPLUTOSDR(void) {
 		iio_channel_attr_write(phy_chn,"gain_control_mode","manual");
 		iio_channel_attr_write_longlong(phy_chn, "hardwaregain", Modes.gain);
 	}
-
-
 }
 
 /* Use a thread reading data in background, while the main thread
  * handles decoding and visualization of data to the user.
  *
- * The reading thread calls the RTLSDR API to read data asynchronously, and
+ * reads data asynchronously, and
  * uses a callback to populate the data buffer.
  * A Mutex is used to avoid races with the decoding thread. */
 void plutosdrCallback(unsigned char *buf, uint32_t len){
@@ -188,9 +194,9 @@ void plutosdrCallback(unsigned char *buf, uint32_t len){
 	if (len > MODES_DATA_LEN) len = MODES_DATA_LEN;
 	/* Move the last part of the previous buffer, that was not processed,
 	 * on the start of the new buffer. */
-	memcpy(Modes.data, Modes.data+MODES_DATA_LEN, (MODES_FULL_LEN-1)*4);
+	memcpy(Modes.data, Modes.data+MODES_DATA_LEN, (FFT_SIZE-1)*32);
 	/* Read the new data. */
-	memcpy(Modes.data+(MODES_FULL_LEN-1)*4, buf, len);
+	memcpy(Modes.data+(FFT_SIZE-1)*32, buf, len);
 	Modes.data_ready = 1;
 	/* Signal to the other thread that new data is ready */
 	pthread_cond_signal(&Modes.data_cond);
@@ -217,9 +223,9 @@ void *readerThreadEntryPoint(void *arg) {
 		for(p_dat = iio_buffer_first(Modes.rxbuf, Modes.rx0_i);p_dat < p_end; p_dat += p_inc){
 			const int16_t i = ((int16_t*)p_dat)[0]; // Real (I)
 			const int16_t q = ((int16_t*)p_dat)[1]; // Imag (Q)
-			https://wiki.analog.com/resources/eval/user-guides/ad-fmcomms2-ebz/software/basic_iq_datafiles#binary_format
-			cb_buf[j*2]=i>>4;
-			cb_buf[j*2+1]=q>>4;
+			// https://wiki.analog.com/resources/eval/user-guides/ad-fmcomms2-ebz/software/basic_iq_datafiles#binary_format
+			cb_buf[j*2]=i;
+			cb_buf[j*2+1]=q;
 			j++;
 
 		}
@@ -239,12 +245,13 @@ void showHelp(void) {
 }
 
 int main(int argc, char **argv) {
-	int j;
+	double mag[5], peak[5];
+	unsigned int k, cnt, bin[5];
 	/* Set sane defaults. */
 	modesInitConfig();
 
 	/* Parse the command line options */
-	for (j = 1; j < argc; j++) {
+	for (int j = 1; j < argc; j++) {
 
 		if (!strcmp(argv[j], "--help")) {
 			showHelp();
@@ -277,14 +284,45 @@ int main(int argc, char **argv) {
 		//computeMagnitudeVector();
 		printf("we have samples! i think");
 		unsigned char *p = Modes.data;
-		int sample = 0;
+		cnt = 0;
 		uint32_t j;
-		for (j = 0; j < Modes.data_len; j += 2) {
-			int i = p[j] - 127;
-			int q = p[j + 1] - 127;
-			printf("sample %d:: i = %d, q = %d\n",sample, i, q);
-			sample++;
+		for (j = 0; j < FFT_SIZE; j += 1) {
+			const int16_t real = ((int16_t*)p)[j]; // Real (I)
+            const int16_t imag = ((int16_t*)p)[j+1]; // Imag (Q)
+			Modes.in_c[cnt] = (real * Modes.win[cnt] + I * imag * Modes.win[cnt]) / 2048;
+			cnt++;
 		}
+
+		fftw_execute(Modes.plan_forward);
+
+		unsigned long long buffer_size_squared = (unsigned long long)FFT_SIZE *
+                    (unsigned long long)FFT_SIZE;
+
+		for (int i = 1; i < FFT_SIZE; ++i) {
+			mag[2] = mag[1];
+			mag[1] = mag[0];
+			mag[0] = 10 * log10((creal(Modes.out[i]) * creal(Modes.out[i]) + cimag(Modes.out[i]) * cimag(
+										Modes.out[i])) / buffer_size_squared);
+			if( i == 60){
+				printf("[%d] %f\n",i, mag[0]);
+			}
+			if (i < 2)
+				continue;
+			for (j = 0; j <= 2; j++) {
+				if  ((mag[1] > peak[j]) &&
+						((!((mag[2] > mag[1]) && (mag[1] > mag[0]))) &&
+						(!((mag[2] < mag[1]) && (mag[1] < mag[0]))))) {
+					for (k = 2; k > j; k--) {
+						peak[k] = peak[k - 1];
+						bin[k] = bin[k - 1];
+					}
+					peak[j] = mag[1];
+					bin[j] = i - 1;
+					break;
+				}
+			}
+        }
+
 		printf("end of sample");
 
 		/* Signal to the other thread that we processed the available data
