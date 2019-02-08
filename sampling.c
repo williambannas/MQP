@@ -19,13 +19,12 @@
 #include <fftw3.h>
 #include "sampling.h"
 
-#define MODES_DEFAULT_RATE         2000000
-#define MODES_DEFAULT_FREQ         902000000
+#define MODES_DEFAULT_RATE         70000
+#define MODES_DEFAULT_FREQ         908000000
+#define FFT_SIZE 		   		   256
 #define MODES_DATA_LEN             (16*16384)   /* 256k */
 #define MODES_AUTO_GAIN            -100         /* Use automatic gain. */
 #define MODES_MAX_GAIN             70       /* Use max available gain. */
-
-#define FFT_SIZE 		   		   128
 
 #define MODES_NOTUSED(V) ((void) V)
 
@@ -101,8 +100,9 @@ void modesInit(void) {
     Modes.plan_forward = fftw_plan_dft_1d(FFT_SIZE, Modes.in_c, Modes.out, FFTW_FORWARD,
                                     FFTW_ESTIMATE);
 
-	for (int i = 0; i < FFT_SIZE; i ++)
-        Modes.win[i] = win_hanning(i, 16384);
+	int i;
+	for (i = 0; i < FFT_SIZE; i ++)
+        Modes.win[i] = win_hanning(i, MODES_DATA_LEN);
 }
 
 /* =============================== PlutoSDR handling ========================== */
@@ -113,7 +113,7 @@ void modesInitPLUTOSDR(void) {
 	printf("* Acquiring IIO context\n");
 	Modes.ctx = iio_create_default_context();
 	if(Modes.ctx == NULL){
-		Modes.ctx = iio_create_network_context("pluto.local");
+		Modes.ctx = iio_create_network_context("192.168.3.1");
 	}
 	device_count = iio_context_get_devices_count(Modes.ctx);
 	if (!device_count) {
@@ -227,7 +227,6 @@ void *readerThreadEntryPoint(void *arg) {
 			cb_buf[j*2]=i;
 			cb_buf[j*2+1]=q;
 			j++;
-
 		}
 		plutosdrCallback(cb_buf,MODES_DATA_LEN);	
 	}
@@ -251,7 +250,8 @@ int main(int argc, char **argv) {
 	modesInitConfig();
 
 	/* Parse the command line options */
-	for (int j = 1; j < argc; j++) {
+	int j;
+	for (j = 1; j < argc; j++) {
 
 		if (!strcmp(argv[j], "--help")) {
 			showHelp();
@@ -289,6 +289,8 @@ int main(int argc, char **argv) {
 		for (j = 0; j < FFT_SIZE; j += 1) {
 			const int16_t real = ((int16_t*)p)[j]; // Real (I)
             const int16_t imag = ((int16_t*)p)[j+1]; // Imag (Q)
+			printf("[%d] I = %d, Q = %d\n",j, real, imag);
+			//Modes.in_c[cnt] = (real + I * imag) / 2048;
 			Modes.in_c[cnt] = (real * Modes.win[cnt] + I * imag * Modes.win[cnt]) / 2048;
 			cnt++;
 		}
@@ -298,14 +300,25 @@ int main(int argc, char **argv) {
 		unsigned long long buffer_size_squared = (unsigned long long)FFT_SIZE *
                     (unsigned long long)FFT_SIZE;
 
-		for (int i = 1; i < FFT_SIZE; ++i) {
+		int i;
+		memset(mag, 0, sizeof(mag));
+		memset(bin, 0, sizeof(bin));
+		memset(peak, 0, sizeof(peak));
+
+		double average_power = 0;
+
+		for (i = 1; i < FFT_SIZE; ++i) {
 			mag[2] = mag[1];
 			mag[1] = mag[0];
 			mag[0] = 10 * log10((creal(Modes.out[i]) * creal(Modes.out[i]) + cimag(Modes.out[i]) * cimag(
 										Modes.out[i])) / buffer_size_squared);
-			if( i == 60){
-				printf("[%d] %f\n",i, mag[0]);
+			
+			printf("[%d] %f\n",i, mag[0]);
+
+			if (i < 5 || i > 122 ){
+				average_power = (mag[0]+average_power)/2;
 			}
+
 			if (i < 2)
 				continue;
 			for (j = 0; j <= 2; j++) {
@@ -322,8 +335,13 @@ int main(int argc, char **argv) {
 				}
 			}
         }
+		printf("Average = %lf\n\n", average_power);
+		printf("peak Average = %lf\n\n", (peak[0]+peak[1]+peak[2]+peak[3]+peak[4])/5);
 
-		printf("end of sample");
+		printf("bin %d, %d, %d, %d, %d\n\n", bin[0], bin[1], bin[2], bin[3], bin[4]);
+		printf("peak %lf, %lf, %lf, %lf, %lf\n\n", peak[0], peak[1], peak[2], peak[3], peak[4]);
+
+		printf("end of sample\n\n");
 
 		/* Signal to the other thread that we processed the available data
 		 * and we want more (useful for --ifile). */
