@@ -18,15 +18,22 @@
 #include <ad9361.h>
 #include <fftw3.h>
 #include "sampling.h"
+#include "tcp_client.c"
 
 #define MODES_DEFAULT_RATE         70000
 #define MODES_DEFAULT_FREQ         908000000
-#define FFT_SIZE 		   		   256
+#define FFT_SIZE 		   		   2048
 #define MODES_DATA_LEN             (16*16384)   /* 256k */
 #define MODES_AUTO_GAIN            -100         /* Use automatic gain. */
 #define MODES_MAX_GAIN             70       /* Use max available gain. */
 
 #define MODES_NOTUSED(V) ((void) V)
+
+static volatile int keepRunning = 1;
+
+void intHandler(int dummy) {
+    keepRunning = 0;
+}
 
 /* Program global state. */
 struct {
@@ -34,7 +41,7 @@ struct {
 	pthread_t reader_thread;
 	pthread_mutex_t data_mutex;     /* Mutex to synchronize buffer access. */
 	pthread_cond_t data_cond;       /* Conditional variable associated. */
-	unsigned char *data;            /* Raw IQ samples buffer */
+	int16_t *data;            /* Raw IQ samples buffer */
 	uint32_t data_len;              /* Buffer length. */
 	int fd;                         /* --ifile option file descriptor. */
 	int data_ready;                 /* Data ready to be processed. */
@@ -84,13 +91,13 @@ void modesInit(void) {
 	 * to process. This way we are able to also detect messages crossing
 	 * two reads. */
 
-	Modes.data_len = MODES_DATA_LEN + sizeof(fftw_complex)*FFT_SIZE;
+	Modes.data_len = MODES_DATA_LEN*2 + sizeof(fftw_complex)*FFT_SIZE;
 	Modes.data_ready = 0;
 	if ((Modes.data = malloc(Modes.data_len)) == NULL) {
 		fprintf(stderr, "Out of memory allocating data buffer.\n");
 		exit(1);
 	}
-	memset(Modes.data, 127, Modes.data_len);
+	memset(Modes.data, 20, Modes.data_len);
 
 	Modes.exit = 0;
 
@@ -185,18 +192,18 @@ void modesInitPLUTOSDR(void) {
  * reads data asynchronously, and
  * uses a callback to populate the data buffer.
  * A Mutex is used to avoid races with the decoding thread. */
-void plutosdrCallback(unsigned char *buf, uint32_t len){
+void plutosdrCallback(int16_t *buf, uint32_t len){
 	pthread_mutex_lock(&Modes.data_mutex);
 	uint32_t i;
 	for (i = 0; i < len; i++){
-		buf[i]^= (uint8_t)0x80;
+		//buf[i]^= (uint8_t)0x80;
 	}
 	if (len > MODES_DATA_LEN) len = MODES_DATA_LEN;
 	/* Move the last part of the previous buffer, that was not processed,
 	 * on the start of the new buffer. */
-	memcpy(Modes.data, Modes.data+MODES_DATA_LEN, (FFT_SIZE-1)*32);
+	memcpy(Modes.data, Modes.data+MODES_DATA_LEN, (FFT_SIZE+1)*sizeof(int16_t));
 	/* Read the new data. */
-	memcpy(Modes.data+(FFT_SIZE-1)*32, buf, len);
+	memcpy(Modes.data+(FFT_SIZE+1)*sizeof(int16_t), buf, len*sizeof(int16_t));
 	Modes.data_ready = 1;
 	/* Signal to the other thread that new data is ready */
 	pthread_cond_signal(&Modes.data_cond);
@@ -210,7 +217,7 @@ void *readerThreadEntryPoint(void *arg) {
 
 	MODES_NOTUSED(arg);
 
-	unsigned char cb_buf[MODES_DATA_LEN];
+	int16_t cb_buf[MODES_DATA_LEN];
 
 	while(!Modes.stop){
 		void *p_dat, *p_end;
@@ -241,6 +248,18 @@ void showHelp(void) {
             // TODO: eventuall this will be helpfull inforamtion, but for now it is just this
 			"welcome to an unhelpful help page\n"
 			);
+}
+
+void create_csv(char *filename, double a[],int n) {
+	FILE *fp;
+	filename=strcat(filename,".csv");
+	fp=fopen(filename,"w+");
+	fprintf(fp,"bin, power\n");
+	int i = 0;
+	for(i=0;i<n;i++){
+    	fprintf(fp,"%d,%lf\n",i+1, a[i]);
+    }
+	fclose(fp);
 }
 
 int main(int argc, char **argv) {
@@ -274,7 +293,8 @@ int main(int argc, char **argv) {
 	pthread_create(&Modes.reader_thread, NULL, readerThreadEntryPoint, NULL);
 
 	pthread_mutex_lock(&Modes.data_mutex);
-	while (1) {
+	signal(SIGINT, intHandler);
+	while (keepRunning) {
 		if (!Modes.data_ready) {
 			pthread_cond_wait(&Modes.data_cond, &Modes.data_mutex);
 			continue;
@@ -282,16 +302,16 @@ int main(int argc, char **argv) {
 		// TODO: get the samples from Modes.data_len;
 		// and just SQRT(I^2 + q^2)
 		//computeMagnitudeVector();
-		printf("we have samples! i think");
-		unsigned char *p = Modes.data;
+		printf("we have samples! i think\n");
+		int16_t *p = Modes.data;
 		cnt = 0;
 		uint32_t j;
 		for (j = 0; j < FFT_SIZE; j += 1) {
 			const int16_t real = ((int16_t*)p)[j]; // Real (I)
             const int16_t imag = ((int16_t*)p)[j+1]; // Imag (Q)
-			printf("[%d] I = %d, Q = %d\n",j, real, imag);
-			//Modes.in_c[cnt] = (real + I * imag) / 2048;
-			Modes.in_c[cnt] = (real * Modes.win[cnt] + I * imag * Modes.win[cnt]) / 2048;
+			//printf("[%d] I = %d, Q = %d\n",j, real, imag);
+			//Modes.in_c[cnt] = (((float) real) + I * ((float)imag));
+			Modes.in_c[cnt] = ( ((double) real) * Modes.win[cnt] + I * ((double)imag) * Modes.win[cnt]);
 			cnt++;
 		}
 
@@ -301,47 +321,66 @@ int main(int argc, char **argv) {
                     (unsigned long long)FFT_SIZE;
 
 		int i;
-		memset(mag, 0, sizeof(mag));
+		memset(mag, -200, sizeof(mag));
 		memset(bin, 0, sizeof(bin));
-		memset(peak, 0, sizeof(peak));
+		memset(peak, -200, sizeof(peak));
 
 		double average_power = 0;
 
-		for (i = 1; i < FFT_SIZE; ++i) {
-			mag[2] = mag[1];
-			mag[1] = mag[0];
-			mag[0] = 10 * log10((creal(Modes.out[i]) * creal(Modes.out[i]) + cimag(Modes.out[i]) * cimag(
-										Modes.out[i])) / buffer_size_squared);
+		double max_power = -200;
+		int max_power_bin = 0;
+		double power[FFT_SIZE];
+
+		for (i=0; i < FFT_SIZE; ++i){
+			power[i] = 10 * log10((creal(Modes.out[i]) * creal(Modes.out[i]) + cimag(Modes.out[i]) * cimag(
+		 								Modes.out[i])) / buffer_size_squared);
+			if (power[i] > max_power){
+				max_power = power[i];
+				max_power_bin = i;
+			}
+		}
+		printf("bin = %d max_power = %lf\n\n", max_power_bin, max_power);
+		char *data = (char*)malloc(4096 * sizeof(char));
+		sprintf(data, "{\"pid\": \"1\", \"RSS\": \"%lf dB\"}", max_power);
+		post_request("192.168.0.104", "1337", "/api/pluto", data);
+
+
+
+		// for (i = 1; i < FFT_SIZE; ++i) {
+		// 	mag[2] = mag[1];
+		// 	mag[1] = mag[0];
+		// 	mag[0] = 10 * log10((creal(Modes.out[i]) * creal(Modes.out[i]) + cimag(Modes.out[i]) * cimag(
+		// 								Modes.out[i])) / buffer_size_squared);
 			
-			printf("[%d] %f\n",i, mag[0]);
+		// 	printf("%d,%f\n",i, mag[0]);
 
-			if (i < 5 || i > 122 ){
-				average_power = (mag[0]+average_power)/2;
-			}
+		// 	if (i < 5 || i > 122 ){
+		// 		average_power = (mag[0]+average_power)/2;
+		// 	}
 
-			if (i < 2)
-				continue;
-			for (j = 0; j <= 2; j++) {
-				if  ((mag[1] > peak[j]) &&
-						((!((mag[2] > mag[1]) && (mag[1] > mag[0]))) &&
-						(!((mag[2] < mag[1]) && (mag[1] < mag[0]))))) {
-					for (k = 2; k > j; k--) {
-						peak[k] = peak[k - 1];
-						bin[k] = bin[k - 1];
-					}
-					peak[j] = mag[1];
-					bin[j] = i - 1;
-					break;
-				}
-			}
-        }
-		printf("Average = %lf\n\n", average_power);
-		printf("peak Average = %lf\n\n", (peak[0]+peak[1]+peak[2]+peak[3]+peak[4])/5);
+		// 	if (i < 2)
+		// 		continue;
+		// 	for (j = 0; j <= 2; j++) {
+		// 		if  ((mag[1] > peak[j]) &&
+		// 				((!((mag[2] > mag[1]) && (mag[1] > mag[0]))) &&
+		// 				(!((mag[2] < mag[1]) && (mag[1] < mag[0]))))) {
+		// 			for (k = 2; k > j; k--) {
+		// 				peak[k] = peak[k - 1];
+		// 				bin[k] = bin[k - 1];
+		// 			}
+		// 			peak[j] = mag[1];
+		// 			bin[j] = i - 1;
+		// 			break;
+		// 		}
+		// 	}
+        // }
+		// printf("Average = %lf\n\n", average_power);
+		// printf("peak Average = %lf\n\n", (peak[0]+peak[1]+peak[2]+peak[3]+peak[4])/5);
 
-		printf("bin %d, %d, %d, %d, %d\n\n", bin[0], bin[1], bin[2], bin[3], bin[4]);
-		printf("peak %lf, %lf, %lf, %lf, %lf\n\n", peak[0], peak[1], peak[2], peak[3], peak[4]);
+		// printf("bin %d, %d, %d, %d, %d\n\n", bin[0], bin[1], bin[2], bin[3], bin[4]);
+		// printf("peak %lf, %lf, %lf, %lf, %lf\n\n", peak[0], peak[1], peak[2], peak[3], peak[4]);
 
-		printf("end of sample\n\n");
+		// printf("end of sample\n\n");
 
 		/* Signal to the other thread that we processed the available data
 		 * and we want more (useful for --ifile). */
