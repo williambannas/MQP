@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<link rel="stylesheet" href="{{url_for('static', filename = 'styles.css') }}" />
+<title>Pluto radio localization</title>
+</head>
+<body>
+<div id="heatmapContainerWrapper">
+<div id="heatmapContainer">
+</div>
+<div id="heatmapLegend">
+<h2>Signal Strength</h2>
+<span id="min"></span>
+<span id="max"></span>
+<img id="gradient" src="" style="width:100%" />
+</div>
+</div>
+<h1>Localization!</h1>
+<script type="text/javascript" src="{{url_for('static', filename = 'heatmap.min.js') }}"></script>
+<script type="text/javascript" src="{{url_for('static', filename = 'scripts.js') }}"></script>
+</body>
+</html>
