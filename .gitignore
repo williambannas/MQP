@@ -5,3 +5,4 @@ misc
 frames.js
 .*.swp
 /venv
+*~
